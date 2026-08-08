@@ -1,0 +1,11 @@
+# ログイン情報を含むブラウザプロファイル(絶対にコミットしない)
+profile/
+
+# ダウンロードした写真・動画と実行記録
+downloads/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
