@@ -26,10 +26,12 @@ import json
 import re
 import shutil
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
 try:
+    from playwright.sync_api import Error as PWError
     from playwright.sync_api import TimeoutError as PWTimeoutError
     from playwright.sync_api import sync_playwright
 except ImportError:  # pragma: no cover
@@ -50,9 +52,13 @@ PHOTOS_URL = "https://photos.google.com/"
 # 容量を消費しているメディアだけがサイズ順に並ぶ公式ページ。
 QUOTA_URL = "https://photos.google.com/quotamanagement/large"
 
-# ゴミ箱移動の確認ダイアログのボタン文言(日本語 / 英語 UI 両対応)
+# 「ゴミ箱に移動」ボタンの文言(ツールバー・確認ダイアログ共通、日本語 / 英語 UI 両対応)
 TRASH_CONFIRM_RE = re.compile(
     r"(ゴミ箱に移動|ごみ箱に移動|Move to trash|Move to bin)", re.IGNORECASE
+)
+# 削除完了時に画面下部へ出るトースト表示
+TRASH_DONE_RE = re.compile(
+    r"(ゴミ箱に移動しました|ごみ箱に移動しました|Moved to trash|Moved to bin)"
 )
 
 MAX_CONSECUTIVE_FAILURES = 3
@@ -222,24 +228,55 @@ def download_current(page, incoming_dir: Path, timeout_s: int) -> Path | None:
 
 
 def delete_current(page) -> bool:
-    """ビューアに表示中のメディアをゴミ箱へ移動する。成功で True。"""
+    """ビューアに表示中のメディアをゴミ箱へ移動する。成功で True。
+
+    ツールバーの「ゴミ箱に移動」ボタンと確認ダイアログ内のボタンは同じ文言のため、
+    確定操作は必ずダイアログ ([role=dialog]) 内のボタンに限定してクリックする。
+    成功の判定は「URL の変化(次のメディアへ進む/一覧へ戻る)」または
+    「完了トースト(ゴミ箱に移動しました)の表示」のどちらかで行う。
+    """
     prev_url = page.url
+    dialog_btn = page.locator('[role="dialog"], [role="alertdialog"]').get_by_role(
+        "button", name=TRASH_CONFIRM_RE
+    )
+    toast = page.get_by_text(TRASH_DONE_RE).first
+
+    # まずキーボードショートカット。効かない画面ではツールバーのボタンをクリック。
     page.keyboard.press("#")
-    try:
-        button = page.get_by_role("button", name=TRASH_CONFIRM_RE)
-        button.first.click(timeout=10_000)
-    except PWTimeoutError:
-        log("  ゴミ箱移動の確認ダイアログが見つかりませんでした")
-        page.keyboard.press("Escape")
-        return False
-    try:
-        # 次のメディアに進む(URL 変化)か、最後の 1 件ならグリッドへ戻る。
-        page.wait_for_url(lambda url: url != prev_url, timeout=15_000)
-    except PWTimeoutError:
-        log("  削除後に画面が切り替わりませんでした")
-        return False
     page.wait_for_timeout(1_000)
-    return True
+    if dialog_btn.count() == 0 and page.url == prev_url:
+        try:
+            page.get_by_role("button", name=TRASH_CONFIRM_RE).first.click(timeout=5_000)
+        except (PWTimeoutError, PWError):
+            log("  「ゴミ箱に移動」ボタンが見つかりませんでした")
+            page.keyboard.press("Escape")
+            return False
+
+    confirmed = False
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if page.url != prev_url:
+            # 次のメディアへ進んだ、または一覧へ戻った → 削除成功
+            page.wait_for_timeout(1_000)
+            return True
+        try:
+            if not confirmed and dialog_btn.count() > 0:
+                dialog_btn.first.click(timeout=3_000)
+                confirmed = True
+                continue
+            if toast.is_visible():
+                # 削除は成功したが URL が変わらない UI → ビューアを閉じて一覧から続行
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(1_000)
+                return True
+        except (PWTimeoutError, PWError):
+            pass
+        page.wait_for_timeout(500)
+
+    log("  削除の完了を確認できませんでした")
+    page.keyboard.press("Escape")
+    page.wait_for_timeout(500)
+    return False
 
 
 def advance_without_delete(page) -> bool:
