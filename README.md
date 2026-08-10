@@ -34,6 +34,21 @@ Google Photos の公式 API では今回の要件を実現できないためで�
 **ローカル PC(Google アカウントにログインできる環境)で実行してください。**
 Python 3.10 以上が必要です。
 
+### Windows (PowerShell)
+
+```powershell
+git clone https://github.com/mmaccy/google_photo_organize.git
+cd google_photo_organize
+python -m pip install -r requirements.txt
+python -m playwright install chromium
+```
+
+- PowerShell では `&&` が使えないことがあるため(標準の PowerShell 5.1 は非対応)、1 行ずつ実行してください。
+- `pip` / `playwright` コマンドが認識されない環境でも動くよう、`python -m` 経由の実行を推奨します。
+- `python` が見つからない場合は `py -m pip ...` / `py -m playwright ...` を試してください。
+
+### macOS / Linux
+
 ```bash
 git clone https://github.com/mmaccy/google_photo_organize.git
 cd google_photo_organize
