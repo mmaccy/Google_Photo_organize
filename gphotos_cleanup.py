@@ -22,9 +22,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import re
+import shutil
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 
@@ -123,14 +124,14 @@ def unique_path(directory: Path, filename: str) -> Path:
     raise RuntimeError(f"保存先ファイル名を確保できません: {filename}")
 
 
-def download_current(page, out_dir: Path, timeout_s: int) -> Path | None:
+def download_current(page, incoming_dir: Path, timeout_s: int) -> Path | None:
     """ビューアに表示中のメディアを Shift+D でダウンロードし、保存できたら Path を返す。"""
     for attempt in (1, 2):
         try:
             with page.expect_download(timeout=timeout_s * 1_000) as dl_info:
                 page.keyboard.press("Shift+KeyD")
             download = dl_info.value
-            dest = unique_path(out_dir, download.suggested_filename)
+            dest = unique_path(incoming_dir, download.suggested_filename)
             download.save_as(dest)  # 完了まで待つ
             if dest.exists() and dest.stat().st_size > 0:
                 return dest
@@ -187,10 +188,89 @@ def save_error_screenshot(page, out_dir: Path, tag: str) -> None:
         pass
 
 
+class BatchManager:
+    """ダウンロードしたファイルを容量上限つきのフォルダ (batch_001, batch_002, ...) に振り分ける。
+
+    フォルダを他のドライブへ移動しても番号を再利用しないよう、
+    これまでに使った最大の番号を state.json に記録しておく。
+    """
+
+    def __init__(self, out_dir: Path, cap_bytes: int):
+        self.out_dir = out_dir
+        self.cap = cap_bytes
+        self.state_path = out_dir / "state.json"
+
+        # ダウンロード完了までの一時置き場(中断で残った中途半端なファイルは掃除する)
+        self.incoming = out_dir / "_incoming"
+        self.incoming.mkdir(parents=True, exist_ok=True)
+        for leftover in self.incoming.iterdir():
+            if leftover.is_file():
+                leftover.unlink(missing_ok=True)
+
+        highest = 0
+        if self.state_path.exists():
+            try:
+                highest = int(json.loads(self.state_path.read_text()).get("highest_batch", 0))
+            except (ValueError, OSError, json.JSONDecodeError):
+                highest = 0
+        for d in out_dir.glob("batch_*"):
+            m = re.fullmatch(r"batch_(\d+)", d.name)
+            if d.is_dir() and m:
+                highest = max(highest, int(m.group(1)))
+
+        if highest and (out_dir / f"batch_{highest:03d}").is_dir():
+            # 前回のフォルダがまだ残っている → 続きから詰める
+            self.index = highest
+            self.bytes = sum(
+                f.stat().st_size for f in self.folder.rglob("*") if f.is_file()
+            )
+        else:
+            # 初回、または前回のフォルダが移動済み → 新しい番号で開始
+            self.index = highest + 1
+            self.bytes = 0
+        self._save_state()
+
+    @property
+    def folder(self) -> Path:
+        return self.out_dir / f"batch_{self.index:03d}"
+
+    def place(self, tmp_path: Path) -> Path:
+        """一時置き場のファイルを、上限を超えない batch フォルダへ移動する。"""
+        size = tmp_path.stat().st_size
+        if self.bytes > 0 and self.bytes + size > self.cap:
+            self.index += 1
+            self.bytes = 0
+            log(f"  フォルダの上限に達したため {self.folder.name}/ に切り替えます。")
+        self.folder.mkdir(parents=True, exist_ok=True)
+        dest = unique_path(self.folder, tmp_path.name)
+        shutil.move(str(tmp_path), str(dest))
+        self.bytes += size
+        self._save_state()
+        return dest
+
+    def _save_state(self) -> None:
+        self.state_path.write_text(json.dumps({"highest_batch": self.index}))
+
+
+def wait_for_free_space(out_dir: Path, min_free_bytes: int) -> bool:
+    """空き容量が確保されるまで待つ。ユーザーが中止を選んだら False。"""
+    while True:
+        free = shutil.disk_usage(out_dir).free
+        if free >= min_free_bytes:
+            return True
+        print()
+        print(f"⚠ ディスクの空き容量が少なくなりました(残り {free / 1_073_741_824:.1f} GB)。")
+        print(f"  {out_dir} の batch_XXX フォルダを別のドライブへ移動して空きを作ってください。")
+        print("  (移動済みフォルダの番号は再利用されないので、そのまま移動して構いません)")
+        answer = input("  空きを作ったら Enter、終了する場合は q + Enter: ")
+        if answer.strip().lower() == "q":
+            return False
+
+
 class Manifest:
     """処理結果を CSV に追記していく記録簿。"""
 
-    FIELDS = ["timestamp", "filename", "size_bytes", "action"]
+    FIELDS = ["timestamp", "filename", "size_bytes", "folder", "action"]
 
     def __init__(self, out_dir: Path):
         self.path = out_dir / "manifest.csv"
@@ -200,12 +280,15 @@ class Manifest:
         if new_file:
             self._writer.writeheader()
 
-    def record(self, filename: str, size_bytes: int | str, action: str) -> None:
+    def record(
+        self, filename: str, size_bytes: int | str, action: str, folder: str = ""
+    ) -> None:
         self._writer.writerow(
             {
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
                 "filename": filename,
                 "size_bytes": size_bytes,
+                "folder": folder,
                 "action": action,
             }
         )
@@ -270,6 +353,8 @@ def cmd_run(args) -> None:
     out_dir = Path(args.out).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest = Manifest(out_dir)
+    batches = BatchManager(out_dir, cap_bytes=int(args.batch_size_gb * 1_073_741_824))
+    min_free_bytes = int(args.min_free_gb * 1_073_741_824)
 
     processed = 0
     downloaded_bytes = 0
@@ -287,7 +372,8 @@ def cmd_run(args) -> None:
             manifest.close()
             return
 
-        log(f"処理を開始します(保存先: {out_dir})")
+        log(f"処理を開始します(保存先: {out_dir}、現在のフォルダ: {batches.folder.name}/)")
+        log(f"1 フォルダあたり {args.batch_size_gb:g} GB まで、空き容量 {args.min_free_gb:g} GB を下回ると一時停止します。")
         if args.no_delete:
             log("--no-delete が指定されているため、削除は行いません。")
 
@@ -298,6 +384,9 @@ def cmd_run(args) -> None:
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                 log("連続で失敗したため安全のため中断します。errors/ の画像を確認してください。")
                 break
+            if not wait_for_free_space(out_dir, min_free_bytes):
+                log("ユーザーの操作により終了します。ここまでの結果は manifest.csv にあります。")
+                break
             if not in_viewer(page):
                 # ビューアが閉じた(最後まで到達など)→ グリッドに戻って残りを確認
                 goto_quota_page(page)
@@ -305,8 +394,8 @@ def cmd_run(args) -> None:
                     log("残りの対象はありません。")
                     break
 
-            dest = download_current(page, out_dir, args.download_timeout)
-            if dest is None:
+            tmp = download_current(page, batches.incoming, args.download_timeout)
+            if tmp is None:
                 failures += 1
                 consecutive_failures += 1
                 manifest.record("(不明)", "", "download_failed")
@@ -317,24 +406,26 @@ def cmd_run(args) -> None:
                     page.wait_for_timeout(1_000)
                 continue
 
+            dest = batches.place(tmp)
             size = dest.stat().st_size
             downloaded_bytes += size
             consecutive_failures = 0
             processed += 1
-            log(f"[{processed}] 保存しました: {dest.name} ({size / 1_048_576:.1f} MB)")
+            folder = dest.parent.name
+            log(f"[{processed}] 保存しました: {folder}/{dest.name} ({size / 1_048_576:.1f} MB)")
 
             if args.no_delete:
-                manifest.record(dest.name, size, "downloaded")
+                manifest.record(dest.name, size, "downloaded", folder)
                 if not advance_without_delete(page):
                     log("最後のメディアに到達しました。")
                     break
             else:
                 if delete_current(page):
-                    manifest.record(dest.name, size, "downloaded_and_trashed")
+                    manifest.record(dest.name, size, "downloaded_and_trashed", folder)
                     log("      → ゴミ箱へ移動しました。")
                 else:
                     failures += 1
-                    manifest.record(dest.name, size, "downloaded_delete_failed")
+                    manifest.record(dest.name, size, "downloaded_delete_failed", folder)
                     save_error_screenshot(page, out_dir, "delete_failed")
                     log("      → ゴミ箱への移動に失敗しました(ファイルは保存済み)。")
                     if not advance_without_delete(page):
@@ -374,6 +465,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=900,
         help="1 件あたりのダウンロード待ち時間の上限(秒、既定 900)",
+    )
+    p_run.add_argument(
+        "--batch-size-gb",
+        type=float,
+        default=15.0,
+        help="1 フォルダ (batch_XXX) あたりの合計サイズ上限 GB(既定 15)",
+    )
+    p_run.add_argument(
+        "--min-free-gb",
+        type=float,
+        default=5.0,
+        help="ディスク空き容量がこの GB を下回ると一時停止してフォルダ移動を促す(既定 5)",
     )
     return parser
 
