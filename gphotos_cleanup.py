@@ -272,45 +272,60 @@ def delete_current(page) -> bool:
             page.wait_for_timeout(400)
         return None
 
-    page.keyboard.press("#")
-    confirm = wait_confirm_button(6)
+    # OK クリックが空振りすることがある(ダイアログ表示直後など)ため、最大 3 回試行する。
+    # URL(=表示中のメディア)が変わっていない間だけ再試行するので、別のアイテムを
+    # 誤って削除することはない。
+    for attempt in (1, 2, 3):
+        if page.url != prev_url:
+            # すでに次へ進んでいた(前回の試行が実は成功していた)
+            page.wait_for_timeout(1_000)
+            return True
 
-    if confirm is None:
-        # ショートカットが効かない場合: ツールバーのゴミ箱ボタン経由でダイアログを開く
-        try:
-            page.get_by_role("button", name=TRASH_CONFIRM_RE).first.click(timeout=5_000)
-        except (PWTimeoutError, PWError):
-            log("  削除ボタン/確認ダイアログが見つかりませんでした")
-            page.keyboard.press("Escape")
-            return False
-        confirm = wait_confirm_button(6)
+        # 確認ダイアログを開く(前回試行の残りがあればそれを使う)
+        confirm = find_confirm_button()
+        if confirm is None:
+            page.keyboard.press("#")
+            confirm = wait_confirm_button(6)
+        if confirm is None:
+            # ショートカットが効かない場合: ツールバーのゴミ箱ボタン経由で開く
+            try:
+                page.get_by_role("button", name=TRASH_CONFIRM_RE).first.click(
+                    timeout=5_000
+                )
+            except (PWTimeoutError, PWError):
+                log("  削除ボタン/確認ダイアログが見つかりませんでした")
+                page.keyboard.press("Escape")
+                return False
+            confirm = wait_confirm_button(6)
         if confirm is None:
             log("  確認ダイアログの OK ボタンが見つかりませんでした")
             page.keyboard.press("Escape")
             return False
 
-    try:
-        confirm.click(timeout=5_000)
-    except (PWTimeoutError, PWError):
-        log("  OK ボタンのクリックに失敗しました")
-        page.keyboard.press("Escape")
-        return False
-
-    deadline = time.monotonic() + 20
-    while time.monotonic() < deadline:
-        if page.url != prev_url:
-            # 次のメディアへ進んだ、または一覧へ戻った → 削除成功
-            page.wait_for_timeout(1_000)
-            return True
         try:
-            if toast.is_visible():
-                # 削除は成功したが URL が変わらない UI → ビューアを閉じて一覧から続行
-                page.keyboard.press("Escape")
+            confirm.click(timeout=5_000)
+        except (PWTimeoutError, PWError):
+            log(f"  OK ボタンのクリックに失敗しました(試行 {attempt}/3)")
+            continue
+
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            if page.url != prev_url:
+                # 次のメディアへ進んだ、または一覧へ戻った → 削除成功
                 page.wait_for_timeout(1_000)
                 return True
-        except PWError:
-            pass
-        page.wait_for_timeout(500)
+            try:
+                if toast.is_visible():
+                    # 削除は成功したが URL が変わらない UI → ビューアを閉じて一覧から続行
+                    page.keyboard.press("Escape")
+                    page.wait_for_timeout(1_000)
+                    return True
+            except PWError:
+                pass
+            page.wait_for_timeout(500)
+
+        if attempt < 3:
+            log(f"  削除の確認が取れませんでした(試行 {attempt}/3)→ 再試行します")
 
     log("  削除の完了を確認できませんでした")
     page.keyboard.press("Escape")
