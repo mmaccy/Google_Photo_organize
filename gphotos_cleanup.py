@@ -52,10 +52,18 @@ PHOTOS_URL = "https://photos.google.com/"
 # 容量を消費しているメディアだけがサイズ順に並ぶ公式ページ。
 QUOTA_URL = "https://photos.google.com/quotamanagement/large"
 
-# 「ゴミ箱に移動」ボタンの文言(ツールバー・確認ダイアログ共通、日本語 / 英語 UI 両対応)
+# ツールバーの「ゴミ箱に移動」ボタンの文言(日本語 / 英語 UI 両対応)
 TRASH_CONFIRM_RE = re.compile(
     r"(ゴミ箱に移動|ごみ箱に移動|Move to trash|Move to bin)", re.IGNORECASE
 )
+# 確認ダイアログ「アイテムをゴミ箱に移動します」の確定ボタン。
+# 実画面では「キャンセル / OK」の 2 ボタン(完全一致で照合し、キャンセルを誤クリックしない)
+DIALOG_OK_RE = re.compile(
+    r"^\s*(OK|ゴミ箱に移動|ごみ箱に移動|Move to trash|Move to bin)\s*$", re.IGNORECASE
+)
+# ダイアログに role が付かない場合の画面全体フォールバック用。
+# 「ゴミ箱に移動」を含めるとツールバーのボタンを誤って拾うため、OK 完全一致のみ。
+OK_ONLY_RE = re.compile(r"^\s*OK\s*$", re.IGNORECASE)
 # 削除完了時に画面下部へ出るトースト表示
 TRASH_DONE_RE = re.compile(
     r"(ゴミ箱に移動しました|ごみ箱に移動しました|Moved to trash|Moved to bin)"
@@ -230,29 +238,64 @@ def download_current(page, incoming_dir: Path, timeout_s: int) -> Path | None:
 def delete_current(page) -> bool:
     """ビューアに表示中のメディアをゴミ箱へ移動する。成功で True。
 
-    ツールバーの「ゴミ箱に移動」ボタンと確認ダイアログ内のボタンは同じ文言のため、
-    確定操作は必ずダイアログ ([role=dialog]) 内のボタンに限定してクリックする。
+    # キーで確認ダイアログ「アイテムをゴミ箱に移動します」(キャンセル / OK)を開き、
+    OK を完全一致で照合してクリックする(キャンセルは絶対に押さない)。
+    ショートカットが効かない画面ではツールバーの「ゴミ箱に移動」ボタンを経由する。
     成功の判定は「URL の変化(次のメディアへ進む/一覧へ戻る)」または
     「完了トースト(ゴミ箱に移動しました)の表示」のどちらかで行う。
     """
     prev_url = page.url
-    dialog_btn = page.locator('[role="dialog"], [role="alertdialog"]').get_by_role(
-        "button", name=TRASH_CONFIRM_RE
-    )
+    dialogs = page.locator('[role="dialog"], [role="alertdialog"]')
     toast = page.get_by_text(TRASH_DONE_RE).first
 
-    # まずキーボードショートカット。効かない画面ではツールバーのボタンをクリック。
+    def find_confirm_button():
+        """確認ダイアログの OK ボタンを探す(ダイアログ内 → 画面全体の可視 OK の順)。"""
+        try:
+            btn = dialogs.get_by_role("button", name=DIALOG_OK_RE)
+            if btn.count() > 0:
+                return btn.first
+            # ダイアログに role が付かない UI へのフォールバック(OK 完全一致のみ)
+            btn = page.get_by_role("button", name=OK_ONLY_RE)
+            for i in range(btn.count()):
+                if btn.nth(i).is_visible():
+                    return btn.nth(i)
+        except PWError:
+            pass
+        return None
+
+    def wait_confirm_button(seconds: float):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            found = find_confirm_button()
+            if found is not None:
+                return found
+            page.wait_for_timeout(400)
+        return None
+
     page.keyboard.press("#")
-    page.wait_for_timeout(1_000)
-    if dialog_btn.count() == 0 and page.url == prev_url:
+    confirm = wait_confirm_button(6)
+
+    if confirm is None:
+        # ショートカットが効かない場合: ツールバーのゴミ箱ボタン経由でダイアログを開く
         try:
             page.get_by_role("button", name=TRASH_CONFIRM_RE).first.click(timeout=5_000)
         except (PWTimeoutError, PWError):
-            log("  「ゴミ箱に移動」ボタンが見つかりませんでした")
+            log("  削除ボタン/確認ダイアログが見つかりませんでした")
+            page.keyboard.press("Escape")
+            return False
+        confirm = wait_confirm_button(6)
+        if confirm is None:
+            log("  確認ダイアログの OK ボタンが見つかりませんでした")
             page.keyboard.press("Escape")
             return False
 
-    confirmed = False
+    try:
+        confirm.click(timeout=5_000)
+    except (PWTimeoutError, PWError):
+        log("  OK ボタンのクリックに失敗しました")
+        page.keyboard.press("Escape")
+        return False
+
     deadline = time.monotonic() + 20
     while time.monotonic() < deadline:
         if page.url != prev_url:
@@ -260,16 +303,12 @@ def delete_current(page) -> bool:
             page.wait_for_timeout(1_000)
             return True
         try:
-            if not confirmed and dialog_btn.count() > 0:
-                dialog_btn.first.click(timeout=3_000)
-                confirmed = True
-                continue
             if toast.is_visible():
                 # 削除は成功したが URL が変わらない UI → ビューアを閉じて一覧から続行
                 page.keyboard.press("Escape")
                 page.wait_for_timeout(1_000)
                 return True
-        except (PWTimeoutError, PWError):
+        except PWError:
             pass
         page.wait_for_timeout(500)
 
