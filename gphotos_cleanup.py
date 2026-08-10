@@ -82,8 +82,28 @@ def in_viewer(page) -> bool:
     return "photo/" in page.url
 
 
-def tile_locator(page):
-    return page.locator('a[href*="photo/"]')
+# グリッドのタイル検出パターン(Google フォトの UI は環境・時期で DOM が異なる)
+ANCHOR_SELECTORS = [
+    'a[href*="quotamanagement"][href*="photo/"]',
+    'a[href*="photo/"]',
+]
+CHECKBOX_SELECTOR = 'div[role="checkbox"][aria-label]'
+
+
+def find_tiles(page):
+    """グリッドのタイルを探す。(種類, locator) を返す。見つからなければ (None, None)。
+
+    種類は 'anchor'(クリックでビューアが開くリンク型)または
+    'checkbox'(ストレージ管理ページの選択型タイル)。
+    """
+    for sel in ANCHOR_SELECTORS:
+        loc = page.locator(sel)
+        if loc.count() > 0:
+            return "anchor", loc
+    loc = page.locator(CHECKBOX_SELECTOR)
+    if loc.count() > 0:
+        return "checkbox", loc
+    return None, None
 
 
 def goto_quota_page(page) -> None:
@@ -95,20 +115,48 @@ def goto_quota_page(page) -> None:
         )
 
 
-def open_first_tile(page) -> bool:
-    """グリッド先頭のメディアをクリックしてビューアを開く。対象が無ければ False。"""
-    tiles = tile_locator(page)
+def open_first_tile(page, interactive: bool = True) -> bool:
+    """グリッド先頭のメディアをビューアで開く。対象が無ければ False。
+
+    リンク型タイルなら自動でクリックする。チェックボックス型タイル
+    (クリックが「選択」になり誤削除につながる)や検出できない場合は、
+    ユーザーに最初の 1 枚を手動で開いてもらう(interactive=True のとき)。
+    """
+    page.wait_for_timeout(2_000)
+    kind, tiles = find_tiles(page)
+
+    if kind == "anchor":
+        tiles.first.click()
+        try:
+            page.wait_for_url(lambda url: "photo/" in url, timeout=15_000)
+            page.wait_for_timeout(1_000)
+            return True
+        except PWTimeoutError:
+            pass  # 手動フォールバックへ
+
+    if not interactive:
+        return False
+
+    print()
+    if kind is None:
+        # タイルを自動検出できない(UI の DOM が想定と違う)か、対象が無くなったかのどちらか。
+        print("タイルを自動検出できませんでした。")
+        print("画面にまだ写真/動画が残っている場合は、60 秒以内に最初の 1 枚を")
+        print("手動でクリックして大きく表示してください(以降は自動で処理します)。")
+        print("残っていない場合は、そのまま待つと終了します。")
+        timeout_ms = 60_000
+    else:
+        # チェックボックス型タイル: 自動クリックは「選択」になり誤削除につながるため手動で開いてもらう。
+        print("グリッドの最初の写真/動画を、ブラウザで手動でクリックして開いてください。")
+        print("(1 枚を大きく表示するビューアが開けば OK です。以降は自動で処理します)")
+        timeout_ms = 180_000
+
     try:
-        tiles.first.wait_for(state="visible", timeout=10_000)
+        page.wait_for_url(lambda url: "photo/" in url, timeout=timeout_ms)
+        page.wait_for_timeout(1_000)
+        return True
     except PWTimeoutError:
         return False
-    tiles.first.click()
-    try:
-        page.wait_for_url(lambda url: "photo/" in url, timeout=15_000)
-    except PWTimeoutError:
-        return False
-    page.wait_for_timeout(1_000)
-    return True
 
 
 def unique_path(directory: Path, filename: str) -> Path:
@@ -322,31 +370,105 @@ def cmd_scan(args) -> None:
         ctx = launch_context(p)
         page = get_page(ctx)
         goto_quota_page(page)
+        page.wait_for_timeout(3_000)
 
-        seen: dict[str, str] = {}  # href -> aria-label
+        detected_kind = None
+        seen: dict[str, str] = {}  # key(href または aria-label) -> label
         stagnant_rounds = 0
         while stagnant_rounds < 5:
             before = len(seen)
-            for tile in tile_locator(page).all():
-                href = tile.get_attribute("href") or ""
-                if href and href not in seen:
-                    seen[href] = tile.get_attribute("aria-label") or ""
+            kind, tiles = find_tiles(page)
+            if kind:
+                detected_kind = detected_kind or kind
+                for tile in tiles.all():
+                    label = tile.get_attribute("aria-label") or ""
+                    href = tile.get_attribute("href") or ""
+                    key = href or label
+                    if key and key not in seen:
+                        seen[key] = label
+            # 仮想スクロールのグリッドを下へ送る(ホイールと PageDown の両方を試す)
+            page.mouse.move(700, 450)
+            page.mouse.wheel(0, 2_500)
             page.keyboard.press("PageDown")
-            page.wait_for_timeout(700)
+            page.wait_for_timeout(800)
             stagnant_rounds = stagnant_rounds + 1 if len(seen) == before else 0
 
         ctx.close()
 
     with scan_path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["label", "href"])
-        for href, label in seen.items():
-            writer.writerow([label, href])
+        writer.writerow(["label", "key"])
+        for key, label in seen.items():
+            writer.writerow([label, key])
 
     log(f"容量を消費しているメディア: {len(seen)} 件(概算)")
     log(f"一覧を書き出しました: {scan_path}")
+    if detected_kind:
+        log(f"検出したタイルの種類: {detected_kind}")
     if not seen:
-        log("対象が見つかりませんでした。容量を消費しているメディアが無い可能性があります。")
+        log("タイルを自動検出できませんでした。ブラウザ上に対象が表示されているのに 0 件になる場合は、")
+        log("`python gphotos_cleanup.py debug` を実行し、表示される診断結果を共有してください。")
+        log("(scan が 0 件でも、run は手動で最初の 1 枚を開けばそのまま使えます)")
+
+
+def cmd_debug(args) -> None:
+    """ストレージ管理ページの DOM を診断し、タイル検出の手がかりを出力する。"""
+    out_dir = Path(args.out).expanduser().resolve()
+    debug_dir = out_dir / "debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    def trunc(s: str, n: int = 90) -> str:
+        return s if len(s) <= n else s[: n - 3] + "..."
+
+    with sync_playwright() as p:
+        ctx = launch_context(p)
+        page = get_page(ctx)
+        goto_quota_page(page)
+        page.wait_for_timeout(5_000)
+
+        print()
+        print("―――― 診断結果(この出力をそのまま共有してください)――――")
+        print(f"URL: {page.url}")
+        print(f"タイトル: {page.title()}")
+
+        candidates = [
+            ('a[href*="quotamanagement"][href*="photo/"]', "quotamanagement リンク"),
+            ('a[href*="photo/"]', "photo/ リンク"),
+            ('div[role="checkbox"][aria-label]', "チェックボックス型タイル"),
+            ("a[href]", "リンク全体"),
+            ('[role="link"]', "role=link"),
+            ('[role="listitem"]', "role=listitem"),
+            ('[role="option"]', "role=option"),
+            ("img", "img 要素"),
+            ("iframe", "iframe"),
+        ]
+        for sel, desc in candidates:
+            try:
+                print(f"  {desc:<24} {sel:<48} : {page.locator(sel).count()} 件")
+            except Exception as e:  # noqa: BLE001
+                print(f"  {desc:<24} {sel:<48} : エラー {e}")
+
+        print("  --- a[href] のサンプル(先頭 10 件) ---")
+        for a in page.locator("a[href]").all()[:10]:
+            href = a.get_attribute("href") or ""
+            label = a.get_attribute("aria-label") or ""
+            print(f"    href={trunc(href)}  aria-label={trunc(label, 60)}")
+
+        print("  --- role=checkbox のサンプル(先頭 5 件) ---")
+        for c in page.locator('[role="checkbox"]').all()[:5]:
+            label = c.get_attribute("aria-label") or ""
+            print(f"    aria-label={trunc(label, 120)}")
+
+        screenshot = debug_dir / "screenshot.png"
+        html = debug_dir / "page.html"
+        page.screenshot(path=str(screenshot))
+        html.write_text(page.content(), encoding="utf-8")
+        print(f"  スクリーンショット: {screenshot}")
+        print(f"  ページ HTML: {html}")
+        print("――――――――――――――――――――――――――――――")
+        print("※ ファイル名などの個人情報が含まれるため、共有する際は必要な範囲だけにしてください。")
+
+        ctx.close()
 
 
 def cmd_run(args) -> None:
@@ -454,6 +576,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_scan = sub.add_parser("scan", help="対象の一覧を確認する(ダウンロードも削除もしない)")
     p_scan.add_argument("--out", default=str(DEFAULT_OUT_DIR), help="出力ディレクトリ")
 
+    p_debug = sub.add_parser(
+        "debug", help="タイル検出がうまくいかない場合の診断情報を出力する"
+    )
+    p_debug.add_argument("--out", default=str(DEFAULT_OUT_DIR), help="出力ディレクトリ")
+
     p_run = sub.add_parser("run", help="ダウンロードして(オプションで)ゴミ箱へ移動する")
     p_run.add_argument("--out", default=str(DEFAULT_OUT_DIR), help="保存先ディレクトリ")
     p_run.add_argument("--limit", type=int, default=0, help="処理する最大件数(0 = 無制限)")
@@ -487,6 +614,8 @@ def main() -> None:
         cmd_login(args)
     elif args.command == "scan":
         cmd_scan(args)
+    elif args.command == "debug":
+        cmd_debug(args)
     elif args.command == "run":
         cmd_run(args)
 
