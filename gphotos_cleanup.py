@@ -69,7 +69,8 @@ TRASH_DONE_RE = re.compile(
     r"(ゴミ箱に移動しました|ごみ箱に移動しました|Moved to trash|Moved to bin)"
 )
 
-MAX_CONSECUTIVE_FAILURES = 3
+# ブラウザ再起動などの自動復旧を挟むため、少し余裕を持たせる
+MAX_CONSECUTIVE_FAILURES = 5
 
 
 def log(msg: str) -> None:
@@ -92,8 +93,28 @@ def get_page(ctx):
     return ctx.pages[0] if ctx.pages else ctx.new_page()
 
 
+def is_closed_error(e: Exception) -> bool:
+    """ページ/ブラウザが閉じられた(または落ちた)ことを示すエラーか。"""
+    return "closed" in str(e).lower()
+
+
+def cleanup_stray_pages(ctx, main_page) -> None:
+    """ダウンロード失敗時に残る 404 エラータブや空タブを閉じる。"""
+    for pg in list(ctx.pages):
+        if pg == main_page:
+            continue
+        try:
+            url = pg.url
+            if "googleusercontent" in url or url in ("about:blank", ""):
+                pg.close()
+        except PWError:
+            pass
+
+
 def in_viewer(page) -> bool:
-    return "photo/" in page.url
+    # ダウンロード失敗時は googleusercontent のエラーページに飛ばされることが
+    # あるため、Google フォトのビューア URL であることを厳密に確認する。
+    return "photos.google.com" in page.url and "photo/" in page.url
 
 
 # ストレージ管理ページのメディア行:
@@ -216,7 +237,12 @@ def unique_path(directory: Path, filename: str) -> Path:
 
 
 def download_current(page, incoming_dir: Path, timeout_s: int) -> Path | None:
-    """ビューアに表示中のメディアを Shift+D でダウンロードし、保存できたら Path を返す。"""
+    """ビューアに表示中のメディアを Shift+D でダウンロードし、保存できたら Path を返す。
+
+    ダウンロード URL が一時的に 404 を返すことがある(ブラウザにエラーページが
+    表示される)。その場合は None を返し、呼び出し側が掃除とスキップを行う。
+    ブラウザ自体が落ちた場合は PWError を送出し、呼び出し側で再起動する。
+    """
     for attempt in (1, 2):
         try:
             with page.expect_download(timeout=timeout_s * 1_000) as dl_info:
@@ -229,9 +255,16 @@ def download_current(page, incoming_dir: Path, timeout_s: int) -> Path | None:
             log(f"  ダウンロードしたファイルが空です: {dest}")
         except PWTimeoutError:
             log(f"  ダウンロードがタイムアウトしました (試行 {attempt}/2)")
+        except PWError as e:
+            log(f"  ダウンロード中のエラー (試行 {attempt}/2): {e}")
+            if is_closed_error(e):
+                raise  # ブラウザごと落ちている → 呼び出し側で再起動
         except Exception as e:  # noqa: BLE001
             log(f"  ダウンロード中のエラー (試行 {attempt}/2): {e}")
-        page.wait_for_timeout(2_000)
+        try:
+            page.wait_for_timeout(5_000)
+        except PWError:
+            raise
     return None
 
 
@@ -651,51 +684,88 @@ def cmd_run(args) -> None:
             if not wait_for_free_space(out_dir, min_free_bytes):
                 log("ユーザーの操作により終了します。ここまでの結果は manifest.csv にあります。")
                 break
-            if not in_viewer(page):
-                # ビューアが閉じた(最後まで到達など)→ グリッドに戻って残りを確認
-                goto_quota_page(page)
-                if not open_first_tile(page):
-                    log("残りの対象はありません。")
-                    break
 
-            tmp = download_current(page, batches.incoming, args.download_timeout)
-            if tmp is None:
-                failures += 1
-                consecutive_failures += 1
-                manifest.record("(不明)", "", "download_failed")
-                save_error_screenshot(page, out_dir, "download_failed")
-                log("  ダウンロードに失敗したため、この項目は削除せずスキップします。")
-                if not advance_without_delete(page):
-                    page.keyboard.press("Escape")
-                    page.wait_for_timeout(1_000)
-                continue
-
-            dest = batches.place(tmp)
-            size = dest.stat().st_size
-            downloaded_bytes += size
-            consecutive_failures = 0
-            processed += 1
-            folder = dest.parent.name
-            log(f"[{processed}] 保存しました: {folder}/{dest.name} ({size / 1_048_576:.1f} MB)")
-
-            if args.no_delete:
-                manifest.record(dest.name, size, "downloaded", folder)
-                if not advance_without_delete(page):
-                    log("最後のメディアに到達しました。")
-                    break
-            else:
-                if delete_current(page):
-                    manifest.record(dest.name, size, "downloaded_and_trashed", folder)
-                    log("      → ゴミ箱へ移動しました。")
-                else:
-                    failures += 1
-                    manifest.record(dest.name, size, "downloaded_delete_failed", folder)
-                    save_error_screenshot(page, out_dir, "delete_failed")
-                    log("      → ゴミ箱への移動に失敗しました(ファイルは保存済み)。")
-                    if not advance_without_delete(page):
+            try:
+                cleanup_stray_pages(ctx, page)
+                if not in_viewer(page):
+                    # ビューアが閉じた/エラーページに飛ばされた → 一覧に戻ってやり直す
+                    goto_quota_page(page)
+                    if not open_first_tile(page):
+                        log("残りの対象はありません。")
                         break
 
-        ctx.close()
+                tmp = download_current(page, batches.incoming, args.download_timeout)
+                if tmp is None:
+                    failures += 1
+                    consecutive_failures += 1
+                    manifest.record("(不明)", "", "download_failed")
+                    save_error_screenshot(page, out_dir, "download_failed")
+                    log("  ダウンロードに失敗したため、この項目は削除せずスキップします。")
+                    if in_viewer(page):
+                        if not advance_without_delete(page):
+                            page.keyboard.press("Escape")
+                            page.wait_for_timeout(1_000)
+                    continue
+
+                dest = batches.place(tmp)
+                size = dest.stat().st_size
+                downloaded_bytes += size
+                consecutive_failures = 0
+                processed += 1
+                folder = dest.parent.name
+                log(f"[{processed}] 保存しました: {folder}/{dest.name} ({size / 1_048_576:.1f} MB)")
+
+                if args.no_delete:
+                    manifest.record(dest.name, size, "downloaded", folder)
+                    if not advance_without_delete(page):
+                        log("最後のメディアに到達しました。")
+                        break
+                else:
+                    if delete_current(page):
+                        manifest.record(dest.name, size, "downloaded_and_trashed", folder)
+                        log("      → ゴミ箱へ移動しました。")
+                    else:
+                        failures += 1
+                        manifest.record(dest.name, size, "downloaded_delete_failed", folder)
+                        save_error_screenshot(page, out_dir, "delete_failed")
+                        log("      → ゴミ箱への移動に失敗しました(ファイルは保存済み)。")
+                        if not advance_without_delete(page):
+                            break
+
+                if args.pause > 0:
+                    page.wait_for_timeout(int(args.pause * 1_000))
+
+            except PWError as e:
+                failures += 1
+                consecutive_failures += 1
+                if is_closed_error(e):
+                    # ダウンロード連発時の一時的な 404 などを引き金にブラウザごと
+                    # 落ちることがある → 再起動して続きから(未削除分は一覧に残っている)
+                    log("ブラウザとの接続が失われました。ブラウザを再起動して続行します。")
+                    try:
+                        ctx.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        ctx = launch_context(p)
+                        page = get_page(ctx)
+                        goto_quota_page(page)
+                        page.wait_for_timeout(3_000)
+                    except Exception as e2:  # noqa: BLE001
+                        log(f"ブラウザの再起動に失敗しました: {e2}")
+                        break
+                else:
+                    log(f"予期しないエラーが発生しました: {e}")
+                    save_error_screenshot(page, out_dir, "unexpected")
+                    try:
+                        page.wait_for_timeout(2_000)
+                    except PWError:
+                        pass
+
+        try:
+            ctx.close()
+        except Exception:  # noqa: BLE001
+            pass
 
     manifest.close()
     log("―――― 結果 ――――")
@@ -746,6 +816,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=5.0,
         help="ディスク空き容量がこの GB を下回ると一時停止してフォルダ移動を促す(既定 5)",
+    )
+    p_run.add_argument(
+        "--pause",
+        type=float,
+        default=2.0,
+        help="1 件処理するごとの待機秒。連続アクセスによる一時的なエラーを抑える(既定 2)",
     )
     return parser
 
