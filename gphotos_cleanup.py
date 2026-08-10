@@ -82,28 +82,47 @@ def in_viewer(page) -> bool:
     return "photo/" in page.url
 
 
-# グリッドのタイル検出パターン(Google フォトの UI は環境・時期で DOM が異なる)
+# ストレージ管理ページのメディア行:
+#   <div data-media-key="AF1Qip..."> の中に「選択」チェックボックスと「開く」ボタン、
+#   テキストとして「(動画は再生時間) 日付 サイズ」を持つリスト形式。
+# data-media-key はサイドバーのアルバム要素にも付くため、チェックボックスの有無で絞り込む。
+ROW_SELECTOR = 'div[data-media-key]:has([role="checkbox"])'
+OPEN_BUTTON_RE = re.compile(r"^(開く|Open)$")
+
+# 旧レイアウト(グリッド+リンク型タイル)へのフォールバック
 ANCHOR_SELECTORS = [
     'a[href*="quotamanagement"][href*="photo/"]',
     'a[href*="photo/"]',
 ]
-CHECKBOX_SELECTOR = 'div[role="checkbox"][aria-label]'
+
+SIZE_RE = re.compile(r"([\d.,]+)\s*(KB|MB|GB)", re.IGNORECASE)
+DATE_RE = re.compile(r"\d{4}/\d{1,2}/\d{1,2}")
 
 
 def find_tiles(page):
-    """グリッドのタイルを探す。(種類, locator) を返す。見つからなければ (None, None)。
+    """メディアの一覧要素を探す。(種類, locator) を返す。見つからなければ (None, None)。
 
-    種類は 'anchor'(クリックでビューアが開くリンク型)または
-    'checkbox'(ストレージ管理ページの選択型タイル)。
+    種類は 'row'(ストレージ管理ページのリスト行)または
+    'anchor'(クリックでビューアが開くリンク型タイル)。
     """
+    loc = page.locator(ROW_SELECTOR)
+    if loc.count() > 0:
+        return "row", loc
     for sel in ANCHOR_SELECTORS:
         loc = page.locator(sel)
         if loc.count() > 0:
             return "anchor", loc
-    loc = page.locator(CHECKBOX_SELECTOR)
-    if loc.count() > 0:
-        return "checkbox", loc
     return None, None
+
+
+def parse_size_mb(text: str) -> float | None:
+    """行のテキストから「272.7 MB」等を MB 単位の数値にして返す。"""
+    m = SIZE_RE.search(text)
+    if not m:
+        return None
+    value = float(m.group(1).replace(",", ""))
+    unit = m.group(2).upper()
+    return value / 1024 if unit == "KB" else value * 1024 if unit == "GB" else value
 
 
 def goto_quota_page(page) -> None:
@@ -125,7 +144,18 @@ def open_first_tile(page, interactive: bool = True) -> bool:
     page.wait_for_timeout(2_000)
     kind, tiles = find_tiles(page)
 
-    if kind == "anchor":
+    if kind == "row":
+        # リスト行の「開く」ボタンをクリックしてビューアを開く。
+        # 行自体のクリックは「選択」トグルになり誤削除につながるため使わない。
+        try:
+            open_btn = tiles.first.get_by_role("button", name=OPEN_BUTTON_RE)
+            open_btn.first.click(timeout=10_000)
+            page.wait_for_url(lambda url: "photo/" in url, timeout=15_000)
+            page.wait_for_timeout(1_000)
+            return True
+        except PWTimeoutError:
+            pass  # 手動フォールバックへ
+    elif kind == "anchor":
         tiles.first.click()
         try:
             page.wait_for_url(lambda url: "photo/" in url, timeout=15_000)
@@ -140,14 +170,13 @@ def open_first_tile(page, interactive: bool = True) -> bool:
     print()
     if kind is None:
         # タイルを自動検出できない(UI の DOM が想定と違う)か、対象が無くなったかのどちらか。
-        print("タイルを自動検出できませんでした。")
+        print("メディアの一覧を自動検出できませんでした。")
         print("画面にまだ写真/動画が残っている場合は、60 秒以内に最初の 1 枚を")
         print("手動でクリックして大きく表示してください(以降は自動で処理します)。")
         print("残っていない場合は、そのまま待つと終了します。")
         timeout_ms = 60_000
     else:
-        # チェックボックス型タイル: 自動クリックは「選択」になり誤削除につながるため手動で開いてもらう。
-        print("グリッドの最初の写真/動画を、ブラウザで手動でクリックして開いてください。")
+        print("最初の写真/動画を、ブラウザで手動でクリックして大きく表示してください。")
         print("(1 枚を大きく表示するビューアが開けば OK です。以降は自動で処理します)")
         timeout_ms = 180_000
 
@@ -373,7 +402,7 @@ def cmd_scan(args) -> None:
         page.wait_for_timeout(3_000)
 
         detected_kind = None
-        seen: dict[str, str] = {}  # key(href または aria-label) -> label
+        seen: dict[str, tuple[str, str, float | None]] = {}  # key -> (date, text, size_mb)
         stagnant_rounds = 0
         while stagnant_rounds < 5:
             before = len(seen)
@@ -381,14 +410,25 @@ def cmd_scan(args) -> None:
             if kind:
                 detected_kind = detected_kind or kind
                 for tile in tiles.all():
-                    label = tile.get_attribute("aria-label") or ""
-                    href = tile.get_attribute("href") or ""
-                    key = href or label
+                    try:
+                        if kind == "row":
+                            key = tile.get_attribute("data-media-key") or ""
+                            text = " ".join((tile.inner_text() or "").split())
+                        else:
+                            key = tile.get_attribute("href") or ""
+                            text = tile.get_attribute("aria-label") or ""
+                    except Exception:  # noqa: BLE001  # 仮想スクロールで要素が消えた場合
+                        continue
                     if key and key not in seen:
-                        seen[key] = label
-            # 仮想スクロールのグリッドを下へ送る(ホイールと PageDown の両方を試す)
-            page.mouse.move(700, 450)
-            page.mouse.wheel(0, 2_500)
+                        date_m = DATE_RE.search(text)
+                        seen[key] = (
+                            date_m.group(0) if date_m else "",
+                            text,
+                            parse_size_mb(text),
+                        )
+            # 仮想スクロールのリストを下へ送る(リスト上にマウスを置いてホイール)
+            page.mouse.move(800, 450)
+            page.mouse.wheel(0, 2_000)
             page.keyboard.press("PageDown")
             page.wait_for_timeout(800)
             stagnant_rounds = stagnant_rounds + 1 if len(seen) == before else 0
@@ -397,16 +437,20 @@ def cmd_scan(args) -> None:
 
     with scan_path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["label", "key"])
-        for key, label in seen.items():
-            writer.writerow([label, key])
+        writer.writerow(["date", "size_mb", "text", "media_key"])
+        for key, (date, text, size_mb) in seen.items():
+            writer.writerow([date, f"{size_mb:.1f}" if size_mb else "", text, key])
 
+    total_mb = sum(s for _, _, s in seen.values() if s)
     log(f"容量を消費しているメディア: {len(seen)} 件(概算)")
+    if total_mb:
+        log(f"合計サイズ: 約 {total_mb / 1024:.2f} GB")
+        log(f"→ 15GB ごとのフォルダ分割で約 {int(total_mb / 1024 / 15) + 1} フォルダになる見込みです。")
     log(f"一覧を書き出しました: {scan_path}")
     if detected_kind:
-        log(f"検出したタイルの種類: {detected_kind}")
+        log(f"検出した一覧の種類: {detected_kind}")
     if not seen:
-        log("タイルを自動検出できませんでした。ブラウザ上に対象が表示されているのに 0 件になる場合は、")
+        log("一覧を自動検出できませんでした。ブラウザ上に対象が表示されているのに 0 件になる場合は、")
         log("`python gphotos_cleanup.py debug` を実行し、表示される診断結果を共有してください。")
         log("(scan が 0 件でも、run は手動で最初の 1 枚を開けばそのまま使えます)")
 
@@ -432,6 +476,7 @@ def cmd_debug(args) -> None:
         print(f"タイトル: {page.title()}")
 
         candidates = [
+            (ROW_SELECTOR, "メディア行 (data-media-key)"),
             ('a[href*="quotamanagement"][href*="photo/"]', "quotamanagement リンク"),
             ('a[href*="photo/"]', "photo/ リンク"),
             ('div[role="checkbox"][aria-label]', "チェックボックス型タイル"),
@@ -458,6 +503,12 @@ def cmd_debug(args) -> None:
         for c in page.locator('[role="checkbox"]').all()[:5]:
             label = c.get_attribute("aria-label") or ""
             print(f"    aria-label={trunc(label, 120)}")
+
+        print("  --- メディア行のサンプル(先頭 3 件) ---")
+        for r in page.locator(ROW_SELECTOR).all()[:3]:
+            key = r.get_attribute("data-media-key") or ""
+            text = " ".join((r.inner_text() or "").split())
+            print(f"    key={trunc(key, 50)}  text={trunc(text, 60)}")
 
         screenshot = debug_dir / "screenshot.png"
         html = debug_dir / "page.html"
