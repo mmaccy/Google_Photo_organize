@@ -136,6 +136,32 @@ batch フォルダを外付け HDD などへ移動して Enter を押せば、�
 | `--download-timeout 秒` | 1 件あたりのダウンロード待ち上限(既定: 900 秒。巨大な動画が多い場合は増やす) |
 | `--batch-size-gb GB` | 1 フォルダあたりの合計サイズ上限(既定: 15) |
 | `--min-free-gb GB` | 空き容量がこの値を下回ると一時停止(既定: 5) |
+| `--pause 秒` | 1 件ごとの待機時間。一時的な 404 対策(既定: 2) |
+| `--url URL` | 処理対象の一覧ページ(既定: サイズの大きい写真と動画)。下記参照 |
+
+### 小さいファイル・他のカテゴリを対象にする(`--url`)
+
+ツール自体にサイズの下限はなく、一覧ページに表示されるものはサイズに関係なく
+処理されます。既定の「サイズの大きい写真と動画」ページはサイズの大きい順なので、
+大きいものを消していけば小さいものが順に先頭に来ます。
+
+もし小さいファイルがこのページに表示されなくなった場合は、他の「確認して削除」
+カテゴリを対象にできます。[photos.google.com/storage](https://photos.google.com/storage)
+を開き、「スクリーンショットと録画」「ぼやけた写真」などのカテゴリを開いて、
+その URL をコピーして渡してください:
+
+```powershell
+python gphotos_cleanup.py scan --url "https://photos.google.com/quotamanagement/screenshots"
+python gphotos_cleanup.py run  --url "https://photos.google.com/quotamanagement/screenshots"
+```
+
+これらのカテゴリページも「容量を消費しているもののみ」を表示する公式ページなので、
+Pixel 特典分が対象外になる性質はそのまま保たれます。
+
+なお、どのカテゴリにも表示されない容量消費ファイルを個別に特定する手段は
+Google が提供していません(API でも不可)。各カテゴリを処理し終えたら、
+[Google One のストレージ内訳](https://one.google.com/storage) で残量を確認し、
+残りが小さければそこで完了とするのが現実的です。
 
 ## 重要な注意事項
 

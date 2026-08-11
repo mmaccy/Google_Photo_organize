@@ -160,13 +160,23 @@ def parse_size_mb(text: str) -> float | None:
     return value / 1024 if unit == "KB" else value * 1024 if unit == "GB" else value
 
 
-def goto_quota_page(page) -> None:
-    page.goto(QUOTA_URL, wait_until="domcontentloaded")
+def goto_quota_page(page, url: str = QUOTA_URL) -> None:
+    page.goto(url, wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
     if "accounts.google.com" in page.url:
         raise SystemExit(
             "ログインしていません。先に `python gphotos_cleanup.py login` を実行してください。"
         )
+
+
+def resolve_list_url(args) -> str:
+    """処理対象の一覧ページ URL。--url 指定があればそれを使う(photos.google.com 限定)。"""
+    url = getattr(args, "url", None) or QUOTA_URL
+    if not url.startswith("https://photos.google.com/"):
+        raise SystemExit(
+            "--url には photos.google.com のストレージ管理ページの URL を指定してください。"
+        )
+    return url
 
 
 def open_first_tile(page, interactive: bool = True) -> bool:
@@ -515,6 +525,7 @@ def cmd_login(_args) -> None:
 
 def cmd_scan(args) -> None:
     """対象(容量を消費しているメディア)の一覧をスクロールしながら収集する。"""
+    list_url = resolve_list_url(args)
     out_dir = Path(args.out).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     scan_path = out_dir / "scan.csv"
@@ -522,7 +533,7 @@ def cmd_scan(args) -> None:
     with sync_playwright() as p:
         ctx = launch_context(p)
         page = get_page(ctx)
-        goto_quota_page(page)
+        goto_quota_page(page, list_url)
         page.wait_for_timeout(3_000)
 
         detected_kind = None
@@ -581,6 +592,7 @@ def cmd_scan(args) -> None:
 
 def cmd_debug(args) -> None:
     """ストレージ管理ページの DOM を診断し、タイル検出の手がかりを出力する。"""
+    list_url = resolve_list_url(args)
     out_dir = Path(args.out).expanduser().resolve()
     debug_dir = out_dir / "debug"
     debug_dir.mkdir(parents=True, exist_ok=True)
@@ -591,7 +603,7 @@ def cmd_debug(args) -> None:
     with sync_playwright() as p:
         ctx = launch_context(p)
         page = get_page(ctx)
-        goto_quota_page(page)
+        goto_quota_page(page, list_url)
         page.wait_for_timeout(5_000)
 
         print()
@@ -647,6 +659,7 @@ def cmd_debug(args) -> None:
 
 
 def cmd_run(args) -> None:
+    list_url = resolve_list_url(args)
     out_dir = Path(args.out).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest = Manifest(out_dir)
@@ -661,7 +674,7 @@ def cmd_run(args) -> None:
     with sync_playwright() as p:
         ctx = launch_context(p)
         page = get_page(ctx)
-        goto_quota_page(page)
+        goto_quota_page(page, list_url)
 
         if not open_first_tile(page):
             log("容量を消費しているメディアが見つかりませんでした。処理するものはありません。")
@@ -689,7 +702,7 @@ def cmd_run(args) -> None:
                 cleanup_stray_pages(ctx, page)
                 if not in_viewer(page):
                     # ビューアが閉じた/エラーページに飛ばされた → 一覧に戻ってやり直す
-                    goto_quota_page(page)
+                    goto_quota_page(page, list_url)
                     if not open_first_tile(page):
                         log("残りの対象はありません。")
                         break
@@ -749,7 +762,7 @@ def cmd_run(args) -> None:
                     try:
                         ctx = launch_context(p)
                         page = get_page(ctx)
-                        goto_quota_page(page)
+                        goto_quota_page(page, list_url)
                         page.wait_for_timeout(3_000)
                     except Exception as e2:  # noqa: BLE001
                         log(f"ブラウザの再起動に失敗しました: {e2}")
@@ -785,13 +798,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("login", help="ブラウザを開いて Google にログインする(初回のみ)")
 
+    url_help = (
+        "処理対象の一覧ページ URL(既定: サイズの大きい写真と動画)。"
+        "photos.google.com/storage の「確認して削除」の各カテゴリ"
+        "(スクリーンショットと録画、ぼやけた写真など)の URL も指定できる"
+    )
+
     p_scan = sub.add_parser("scan", help="対象の一覧を確認する(ダウンロードも削除もしない)")
     p_scan.add_argument("--out", default=str(DEFAULT_OUT_DIR), help="出力ディレクトリ")
+    p_scan.add_argument("--url", default=QUOTA_URL, help=url_help)
 
     p_debug = sub.add_parser(
         "debug", help="タイル検出がうまくいかない場合の診断情報を出力する"
     )
     p_debug.add_argument("--out", default=str(DEFAULT_OUT_DIR), help="出力ディレクトリ")
+    p_debug.add_argument("--url", default=QUOTA_URL, help=url_help)
 
     p_run = sub.add_parser("run", help="ダウンロードして(オプションで)ゴミ箱へ移動する")
     p_run.add_argument("--out", default=str(DEFAULT_OUT_DIR), help="保存先ディレクトリ")
@@ -823,6 +844,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=2.0,
         help="1 件処理するごとの待機秒。連続アクセスによる一時的なエラーを抑える(既定 2)",
     )
+    p_run.add_argument("--url", default=QUOTA_URL, help=url_help)
     return parser
 
 
